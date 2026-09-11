@@ -37,7 +37,10 @@ void process_init(void) {
 pcb_t *process_create(void (*entry)(void)) {
     pcb_t *p = NULL;
     for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (pcb_table[i].state == PROC_UNUSED) { p = &pcb_table[i]; break; }
+        if (pcb_table[i].state == PROC_UNUSED || pcb_table[i].state == TERMINATED) {
+            p = &pcb_table[i];
+            break;
+        }
     }
     if (!p) return NULL;   /* process table full */
 
@@ -60,6 +63,25 @@ pcb_t *process_create(void (*entry)(void)) {
     *(--sp) = 0;                 /* EDI */
 
     p->esp = (uint32_t)sp;
+    return p;
+}
+
+void pcb_queue_add(pcb_t **head, pcb_t **tail, pcb_t *p) {
+    p->next = NULL;
+    if (!*head) {
+        *head = *tail = p;
+    } else {
+        (*tail)->next = p;
+        *tail = p;
+    }
+}
+
+pcb_t *pcb_queue_remove(pcb_t **head, pcb_t **tail) {
+    if (!*head) return NULL;
+    pcb_t *p = *head;
+    *head = p->next;
+    if (!*head) *tail = NULL;
+    p->next = NULL;
     return p;
 }
 

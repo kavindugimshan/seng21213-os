@@ -23,7 +23,10 @@ seng21213-os/
 │   ├── scheduler.c             # Round-robin ready queue + timer tick handler
 │   ├── switch.asm              # IRQ0 context-switch stub (PUSHAD/POPAD)
 │   ├── idt.c / idt.h           # IDT + 8259 PIC remap (needed for IRQ0)
-│   └── pit.c / pit.h           # i8253 PIT driver (100 Hz timer tick)
+│   ├── pit.c / pit.h           # i8253 PIT driver (100 Hz timer tick)
+│   ├── thread.c / thread.h     # kernel threads: thread_create(fn, arg) (Stage 2)
+│   ├── mutex.c / mutex.h       # blocking mutex_lock()/mutex_unlock()
+│   └── semaphore.c / semaphore.h  # counting semaphore sem_wait()/sem_signal()
 ├── include/
 │   └── types.h           # Primitive integer types (freestanding, no libc)
 ├── linker.ld             # Linker script - places the kernel at 0x10000
@@ -37,7 +40,7 @@ seng21213-os/
 |------------------|------------------------------|-----------------|--------|
 | Stage 0 (L07-L08) | Boot, VGA & Shell            | `v0.1-stage0`   | Done |
 | Stage 1 (L09)     | Process Table & Scheduler    | `v0.2-stage1`   | Done |
-| Stage 2 (L10)     | Threads, Mutex & Semaphore   | `v0.3-stage2`   | Pending |
+| Stage 2 (L10)     | Threads, Mutex & Semaphore   | `v0.3-stage2`   | Done |
 | Stage 3 (L11)     | Physical Memory Manager      | `v0.4-stage3`   | Pending |
 | Stage 4 (L12)     | RAM Disk File System         | `v0.5-stage4`   | Pending |
 
@@ -165,6 +168,76 @@ shell's cursor.
    `version` - it should stay fully responsive.
 4. `ps` - should list 3 PCBs (pid 0 = the shell, pid 1 and 2 = the demo
    processes) with their state (`RUNNING`/`READY`) and ESP.
+5. `halt` - should still stop the CPU cleanly with no crash or reboot.
+
+No optional/bonus extensions are implemented in this stage.
+
+## Stage 2: Threads, Mutex & Semaphore
+
+Stage 2 adds kernel threads and the two classic synchronisation primitives
+on top of Stage 1's scheduler, and uses them to demonstrate a real race
+condition and a correct producer-consumer solution.
+
+**How it fits together:**
+
+- `kernel/thread.h/.c` - `thread_create(fn, arg)` creates a schedulable PCB
+  (via `process_create()`) whose entry point is a small trampoline that
+  looks up the (fn, arg) pair for "whichever PCB I currently am" and calls
+  `fn(arg)`. Since this kernel has no virtual memory yet, every thread
+  already runs in the same flat address space as everything else - which is
+  exactly the property "kernel threads sharing an address space" is about.
+- `kernel/mutex.h/.c` - `mutex_lock()`/`mutex_unlock()`. A thread that finds
+  the mutex held is moved to `BLOCKED` and taken off the CPU entirely (not
+  spin-waiting): it is added to the mutex's own wait queue and immediately
+  switched away. `mutex_unlock()` wakes the next waiter, if any.
+- `kernel/semaphore.h/.c` - `sem_wait()`/`sem_signal()`, a counting
+  semaphore built the same way (block instead of spin when the count is 0).
+- `kernel/process.h/.c` gained `pcb_queue_add()`/`pcb_queue_remove()`, a
+  small generic linked-queue helper shared by the scheduler's ready queue
+  and by every mutex/semaphore's wait queue (a process is only ever in one
+  such queue at a time, so they can all reuse `pcb->next`).
+- **Scheduler fix:** Stage 1's `scheduler_tick()` only ever switched
+  processes at a 100 ms quantum boundary. That is fine for routine
+  round-robin, but a thread that just blocked (or that explicitly calls
+  `process_yield()`) must be switched away from *immediately*, or it would
+  fall straight back into the code that just blocked it. `scheduler_tick()`
+  now also forces a switch whenever the current process's state is no
+  longer `RUNNING`, or a new `process_yield()` requested one.
+
+**Race-condition demo (`race`):** two threads each increment a shared
+`myglobal` 500 times. Every iteration deliberately does an unprotected
+read...`process_yield()`...modify...write, which reliably forces the two
+threads to interleave on (almost) every increment - instead of hoping a
+real timer tick happens to land in the tiny natural race window. Run once
+without a mutex (final value comes out wrong - lost updates) and once with
+a mutex held across the same three lines (always comes out correct).
+
+**Producer-consumer demo (`producer`):** a producer and a consumer thread
+share a 5-slot bounded buffer, synchronised with exactly three counting
+semaphores - `sem_empty` (free slots), `sem_full` (filled slots) and
+`sem_mutex` (mutual exclusion on the buffer itself). 10 items are produced
+and consumed; the demo prints every put/get so you can see the buffer never
+overflows, underflows, or loses an item.
+
+**New shell commands:**
+
+| Command    | Arguments | Behaviour                                             |
+|------------|-----------|--------------------------------------------------------|
+| `race`     | -         | Runs the race-condition demo without, then with, a mutex |
+| `producer` | -         | Runs the bounded-buffer producer-consumer demo            |
+
+### How to test Stage 2
+
+1. `make run` and wait for the splash screen (the Stage 1 spinners should
+   still be running in the top-right corner).
+2. `race` - prints `WITHOUT mutex : myglobal = <something less than 1000>`
+   followed by `<-- CORRUPTED, lost updates!`, then
+   `WITH mutex : myglobal = 1000  (correct)`.
+3. `producer` - prints 10 `[producer] put N in slot S` / `[consumer] got N
+   from slot S` pairs in order, ending with "Done - all items produced and
+   consumed, no corruption."
+4. `ps` - the finished demo threads should show as `TERMINATED`, while
+   pid 0-2 (shell + Stage 1 spinners) are still `RUNNING`/`READY`.
 5. `halt` - should still stop the CPU cleanly with no crash or reboot.
 
 No optional/bonus extensions are implemented in this stage.

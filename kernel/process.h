@@ -43,6 +43,13 @@ void   process_init(void);
 pcb_t *process_create(void (*entry)(void));
 void   process_list(void);          /* implements the 'ps' shell command */
 
+/* Generic singly-linked PCB queue, shared by the scheduler's ready queue
+ * (scheduler.c) and the wait queues of mutex_t / semaphore_t (L10) - a
+ * blocked process is never in more than one such queue at a time, so it is
+ * safe for all of them to reuse the same pcb->next field. */
+void   pcb_queue_add(pcb_t **head, pcb_t **tail, pcb_t *p);
+pcb_t *pcb_queue_remove(pcb_t **head, pcb_t **tail);
+
 /* --- scheduler.c --------------------------------------------------------
  * scheduler_tick() is called from the IRQ0 assembly stub (switch.asm) on
  * every timer tick; it returns the ESP of the process that should run next.
