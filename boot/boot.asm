@@ -9,6 +9,12 @@
 [BITS 16]           ; CPU starts in 16-bit Real Mode
 [ORG 0x7C00]        ; BIOS loads the MBR at this fixed address
 
+; L11 - BIOS E820 memory map (must be read here, in real mode - protected
+; mode code has no BIOS to call). Stored for kernel/pmm.c to parse later.
+E820_COUNT       equ 0x8000   ; word: number of entries found
+E820_ENTRIES     equ 0x8004   ; up to MAX_E820_ENTRIES entries, 24 bytes each
+MAX_E820_ENTRIES equ 32
+
 ; ---------------------------------------------------------------------------
 ; Entry: Real Mode setup
 ; ---------------------------------------------------------------------------
@@ -50,6 +56,9 @@ load_kernel:
 
     mov  si, msg_ok
     call print_rm
+
+    call detect_memory     ; L11 - fill E820_COUNT/E820_ENTRIES before we
+                            ; lose BIOS access by entering protected mode
 
 ; ---------------------------------------------------------------------------
 ; Enter Protected Mode
@@ -111,6 +120,41 @@ print_rm:
     int  0x10
     jmp  print_rm
 .done:
+    ret
+
+; ---------------------------------------------------------------------------
+; Subroutine: detect_memory - BIOS INT 0x15, EAX=0xE820 memory map (L11).
+; Standard algorithm (see OSDev "Detecting Memory (x86)"): repeatedly call
+; INT 0x15 with EDX='SMAP', each call filling one 24-byte entry at ES:DI and
+; returning a continuation value in EBX; EBX=0 after a call means that was
+; the last entry. Stops early on error (CF set) or if the entry count cap
+; is reached, so a misbehaving BIOS can't overrun the buffer.
+; ---------------------------------------------------------------------------
+detect_memory:
+    push es
+    xor  ax, ax
+    mov  es, ax          ; ES was left at 0x1000 by load_kernel - reset it,
+                          ; or ES:DI below would write to the wrong segment
+    xor  ebx, ebx
+    mov  di, E820_ENTRIES
+    xor  bp, bp
+.next_entry:
+    mov  eax, 0xE820
+    mov  ecx, 24
+    mov  edx, 0x534D4150     ; 'SMAP'
+    int  0x15
+    jc   .done               ; carry set - unsupported or end of list
+    cmp  eax, 0x534D4150      ; BIOS must echo the signature back on success
+    jne  .done
+    cmp  bp, MAX_E820_ENTRIES
+    jae  .done
+    inc  bp
+    add  di, 24
+    test ebx, ebx
+    jnz  .next_entry          ; EBX=0 means that was the last entry
+.done:
+    mov  [E820_COUNT], bp
+    pop  es
     ret
 
 ; ---------------------------------------------------------------------------

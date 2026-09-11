@@ -1,5 +1,5 @@
 /* =============================================================================
- * SENG21213-OS :: Main Kernel  (Stage 2 - Threads, Mutex & Semaphore)
+ * SENG21213-OS :: Main Kernel  (Stage 3 - Physical Memory Manager)
  * File   : kernel/kernel.c
  *
  * PURPOSE
@@ -8,21 +8,23 @@
  *     2. Initialises the keyboard driver
  *     3. Sets up the IDT, remaps the PIC and programs the PIT for a 100 Hz
  *        timer tick (L09) so the round-robin scheduler can pre-empt
- *     4. Creates two background demo processes to prove pre-emption works
- *     5. Prints a splash screen
- *     6. Runs a minimal interactive shell ("ksh"), itself scheduled as PCB 0,
+ *     4. Builds the physical memory bitmap from the E820 map boot.asm left
+ *        behind, and self-tests it (L11)
+ *     5. Creates two background demo processes to prove pre-emption works
+ *     6. Prints a splash screen
+ *     7. Runs a minimal interactive shell ("ksh"), itself scheduled as PCB 0,
  *        which can also launch the Stage 2 thread/mutex/semaphore demos
  *
  * ASSIGNMENT MILESTONES  (what YOU will add in later lectures)
  *   Lecture  9  - Process Management  ->  process.h / process.c / scheduler.c        [DONE]
  *   Lecture 10  - Threads & Sync      ->  thread.c / mutex.c / semaphore.c            [DONE]
- *   Lecture 11  - Memory Management   ->  pmm.h     / pmm.c / vmm.c
+ *   Lecture 11  - Memory Management   ->  pmm.h / pmm.c (E820 + bitmap frame alloc)   [DONE]
  *   Lecture 12  - File System         ->  fs.h      / fs.c
  *
  * CODING CONVENTION
  *   - Prefix kernel-internal functions with k_ (e.g. k_strcmp)
  *   - All driver APIs live in their own .h/.c pair
- *   - NEVER call malloc - use the PMM you build in Lecture 11
+ *   - NEVER call malloc - use the PMM built in kernel/pmm.c
  * ============================================================================*/
 
 #include "vga.h"
@@ -33,6 +35,7 @@
 #include "thread.h"
 #include "mutex.h"
 #include "semaphore.h"
+#include "pmm.h"
 #include "../include/types.h"
 
 /* ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ static void cmd_halt(void);
 static void cmd_ps(void);
 static void cmd_race(void);
 static void cmd_producer(void);
+static void cmd_meminfo(void);
 
 /* ---------------------------------------------------------------------------
  * Utility: minimal string helpers (no libc in a freestanding kernel!)
@@ -101,7 +105,7 @@ static void print_splash(void) {
                    VGA_YELLOW, VGA_BLACK);
 
     vga_set_cursor(2, 2);
-    vga_puts_color("  Stage 2: Threads, Mutex & Semaphore", VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts_color("  Stage 3: Physical Memory Manager", VGA_LIGHT_CYAN, VGA_BLACK);
 
     vga_set_cursor(3, 2);
     vga_puts_color("  Faculty of Engineering - Department of Software Engineering",
@@ -126,8 +130,8 @@ static void print_splash(void) {
     vga_puts("Process Management  - PCB, ready queue, round-robin scheduler   (done)\n");
     vga_puts_color("    [L10] ", VGA_LIGHT_GREEN, VGA_BLACK);
     vga_puts("Threads & Sync      - kernel threads, mutex, semaphore          (done)\n");
-    vga_puts_color("    [L11] ", VGA_YELLOW, VGA_BLACK);
-    vga_puts("Memory Management   - physical page allocator, virtual memory\n");
+    vga_puts_color("    [L11] ", VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_puts("Memory Management   - E820 map, bitmap frame allocator          (done)\n");
     vga_puts_color("    [L12] ", VGA_YELLOW, VGA_BLACK);
     vga_puts("File System         - RAM disk, FAT-like directory structure\n");
     vga_puts("\n");
@@ -151,7 +155,8 @@ static void cmd_help(void) {
     vga_puts("  clear   - Clear the screen\n");
     vga_puts("  about   - About this OS and course\n");
     vga_puts("  echo    - Echo text to screen\n");
-    vga_puts("  mem     - Memory map (stub)\n");
+    vga_puts("  mem     - [L11] Show the BIOS E820 memory map\n");
+    vga_puts("  meminfo - [L11] Show total/used/free physical memory\n");
     vga_puts("  version - Show kernel name and version\n");
     vga_puts("  colour  - colour <fg> <bg>  (values 0-15)\n");
     vga_puts("  halt    - Disable interrupts and halt the CPU\n");
@@ -161,7 +166,6 @@ static void cmd_help(void) {
     vga_puts_color("\n  Milestones (to implement):\n", VGA_LIGHT_CYAN, VGA_BLACK);
     vga_puts("  kill    - [L09] Terminate a process\n");
     vga_puts("  threads - [L10] List kernel threads\n");
-    vga_puts("  free    - [L11] Show free memory\n");
     vga_puts("  ls      - [L12] List files\n");
     vga_puts("  cat     - [L12] Print file contents\n\n");
 }
@@ -187,23 +191,50 @@ static void cmd_echo(const char *args) {
     vga_puts("\n");
 }
 
+static const char *e820_type_name(uint32_t type) {
+    switch (type) {
+        case 1:  return "Usable";
+        case 2:  return "Reserved";
+        case 3:  return "ACPI Reclaimable";
+        case 4:  return "ACPI NVS";
+        case 5:  return "Bad Memory";
+        default: return "Unknown";
+    }
+}
+
+/* L11 - the real BIOS E820 map boot.asm collected in real mode, replacing
+ * the Stage 0 hard-coded guess this command used to print. */
 static void cmd_mem(void) {
-    /* Stage 0 stub - students implement the real PMM in Lecture 11 */
-    vga_puts_color("\n  Memory Map (stub - implement PMM in Lecture 11)\n",
-                   VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts_color("\n  BIOS E820 Memory Map\n", VGA_LIGHT_CYAN, VGA_BLACK);
     vga_puts("  ---------------------------------------------\n");
-    vga_puts("  0x00000000 - 0x000FFFFF  :  First 1 MB (reserved/BIOS)\n");
-    vga_puts("  0x00100000 - 0x00EFFFFF  :  Extended memory (usable ~14 MB)\n");
-    vga_puts("  0x00F00000 - 0x00FFFFFF  :  BIOS / ROM area\n");
-    vga_puts("  0xB8000    - 0xBFFFF     :  VGA frame buffer\n");
-    vga_puts_color("\n  TODO: Use BIOS int 0x15, EAX=0xE820 to get real memory map\n\n",
-                   VGA_YELLOW, VGA_BLACK);
+
+    uint32_t count = pmm_e820_count();
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t base, length; uint32_t type;
+        pmm_e820_get(i, &base, &length, &type);
+        vga_printf("  0x%x - 0x%x  :  %s\n",
+                   (uint32_t)base, (uint32_t)(base + length), e820_type_name(type));
+    }
+    vga_puts("\n");
+}
+
+/* L11 - total/used/free summary from the bitmap frame allocator */
+static void cmd_meminfo(void) {
+    uint32_t total = pmm_total_frames();
+    uint32_t used  = pmm_used_frames();
+    uint32_t free_ = pmm_free_frames();
+
+    vga_puts_color("\n  Physical Memory (managed from 1 MB upward)\n", VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts("  ---------------------------------------------\n");
+    vga_printf("  Total : %d MB  (%d frames)\n", (total * 4) / 1024, total);
+    vga_printf("  Used  : %d MB  (%d frames)\n",  (used  * 4) / 1024, used);
+    vga_printf("  Free  : %d MB  (%d frames)\n\n", (free_ * 4) / 1024, free_);
 }
 
 /* L08 - prints the kernel name and version string for this stage */
 static void cmd_version(void) {
-    vga_puts("\n  SENG21213-OS  v0.3-stage2\n");
-    vga_puts("  Stage 2 : Threads, Mutex & Semaphore\n\n");
+    vga_puts("\n  SENG21213-OS  v0.4-stage3\n");
+    vga_puts("  Stage 3 : Physical Memory Manager\n\n");
 }
 
 /* L08 - colour <fg> <bg>, both 0-15 (see vga.h vga_color_t) */
@@ -438,6 +469,7 @@ static void shell_run(void) {
         if (k_strcmp(cmd, "ps")      == 0) { cmd_ps();      continue; }
         if (k_strcmp(cmd, "race")     == 0) { cmd_race();     continue; }
         if (k_strcmp(cmd, "producer") == 0) { cmd_producer(); continue; }
+        if (k_strcmp(cmd, "meminfo")  == 0) { cmd_meminfo();  continue; }
 
         if (k_strncmp(cmd, "echo ", 5) == 0) {
             cmd_echo(k_ltrim(cmd + 5));
@@ -452,7 +484,6 @@ static void shell_run(void) {
         /* Milestone stubs */
         if (k_strcmp(cmd, "kill")    == 0 ||
             k_strcmp(cmd, "threads") == 0 ||
-            k_strcmp(cmd, "free")    == 0 ||
             k_strcmp(cmd, "ls")      == 0 ||
             k_strcmp(cmd, "cat")     == 0) {
             vga_puts_color("  [TODO] This command is not yet implemented.\n",
@@ -464,6 +495,37 @@ static void shell_run(void) {
         vga_puts_color("  Unknown command: ", VGA_LIGHT_RED, VGA_BLACK);
         vga_puts(cmd);
         vga_puts("\n  Type 'help' for a list of commands.\n");
+    }
+}
+
+/* L11 - allocates and frees 100 frames and checks the free count comes back
+ * to exactly where it started, proving pmm_alloc_frame()/pmm_free_frame()
+ * don't leak. Runs once at boot so the proof is visible every time. */
+#define PMM_SELFTEST_FRAMES 100
+
+static void pmm_selftest(void) {
+    uint32_t addrs[PMM_SELFTEST_FRAMES];
+    uint32_t free_before = pmm_free_frames();
+    int ok = 1;
+
+    for (int i = 0; i < PMM_SELFTEST_FRAMES; i++) {
+        addrs[i] = pmm_alloc_frame();
+        if (addrs[i] == 0) ok = 0;                 /* ran out of memory */
+        for (int j = 0; j < i; j++) {
+            if (addrs[j] == addrs[i]) ok = 0;       /* same frame handed out twice */
+        }
+    }
+    for (int i = 0; i < PMM_SELFTEST_FRAMES; i++) {
+        pmm_free_frame(addrs[i]);
+    }
+
+    uint32_t free_after = pmm_free_frames();
+    if (!ok || free_after != free_before) {
+        vga_puts_color("  [PMM self-test] FAILED - frame leak or double-allocation\n",
+                       VGA_LIGHT_RED, VGA_BLACK);
+    } else {
+        vga_printf("  [PMM self-test] allocate/free %d frames: OK, no leaks\n",
+                   PMM_SELFTEST_FRAMES);
     }
 }
 
@@ -481,6 +543,7 @@ void kernel_main(void) {
      * interrupts on - otherwise IRQ0 could fire into an empty scheduler. */
     idt_init();
     pit_init(100);          /* 100 Hz -> a tick every 10 ms */
+    pmm_init();              /* L11 - parse the E820 map, build the bitmap */
     process_init();
     scheduler_init();
 
@@ -492,6 +555,7 @@ void kernel_main(void) {
     __asm__ __volatile__("sti");   /* pre-emption is now live */
 
     print_splash();
+    pmm_selftest();
     shell_run();
 
     /* Should never reach here */

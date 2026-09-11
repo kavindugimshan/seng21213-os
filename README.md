@@ -13,7 +13,8 @@ finally a simple file system.
 ```
 seng21213-os/
 ├── boot/
-│   └── boot.asm          # MBR bootloader (NASM, 16-bit real mode -> 32-bit protected mode)
+│   └── boot.asm          # MBR bootloader: 16-bit real mode -> BIOS E820 memory
+│                          # map (Stage 3) -> 32-bit protected mode
 ├── kernel/
 │   ├── kernel_entry.asm  # Protected-mode entry point, calls kernel_main()
 │   ├── kernel.c          # Main kernel: shell loop, command dispatch
@@ -26,7 +27,8 @@ seng21213-os/
 │   ├── pit.c / pit.h           # i8253 PIT driver (100 Hz timer tick)
 │   ├── thread.c / thread.h     # kernel threads: thread_create(fn, arg) (Stage 2)
 │   ├── mutex.c / mutex.h       # blocking mutex_lock()/mutex_unlock()
-│   └── semaphore.c / semaphore.h  # counting semaphore sem_wait()/sem_signal()
+│   ├── semaphore.c / semaphore.h  # counting semaphore sem_wait()/sem_signal()
+│   └── pmm.c / pmm.h           # bitmap physical frame allocator (Stage 3)
 ├── include/
 │   └── types.h           # Primitive integer types (freestanding, no libc)
 ├── linker.ld             # Linker script - places the kernel at 0x10000
@@ -41,7 +43,7 @@ seng21213-os/
 | Stage 0 (L07-L08) | Boot, VGA & Shell            | `v0.1-stage0`   | Done |
 | Stage 1 (L09)     | Process Table & Scheduler    | `v0.2-stage1`   | Done |
 | Stage 2 (L10)     | Threads, Mutex & Semaphore   | `v0.3-stage2`   | Done |
-| Stage 3 (L11)     | Physical Memory Manager      | `v0.4-stage3`   | Pending |
+| Stage 3 (L11)     | Physical Memory Manager      | `v0.4-stage3`   | Done |
 | Stage 4 (L12)     | RAM Disk File System         | `v0.5-stage4`   | Pending |
 
 ## Building & Running
@@ -238,6 +240,65 @@ overflows, underflows, or loses an item.
    consumed, no corruption."
 4. `ps` - the finished demo threads should show as `TERMINATED`, while
    pid 0-2 (shell + Stage 1 spinners) are still `RUNNING`/`READY`.
+5. `halt` - should still stop the CPU cleanly with no crash or reboot.
+
+No optional/bonus extensions are implemented in this stage.
+
+## Stage 3: Physical Memory Manager
+
+Stage 3 adds a real physical-memory allocator, built from the machine's
+actual BIOS-reported memory map rather than a guess.
+
+**How it fits together:**
+
+- `boot/boot.asm` now also calls BIOS `INT 0x15, EAX=0xE820` in real mode
+  (a `detect_memory` routine, right after the kernel is loaded from disk and
+  before entering protected mode) - protected-mode code has no way to call
+  the BIOS at all, so this step *has* to happen in the bootloader. The
+  result (an entry count and up to 32 24-byte entries) is left at two fixed
+  physical addresses, `0x8000` and `0x8004`, safely below where the kernel
+  is loaded (`0x10000`).
+- `kernel/pmm.c` reads that map and builds a bitmap - one bit per 4 KB
+  frame - covering every "usable" (type 1) region from 1 MB upward.
+  Everything below 1 MB (BIOS data, the boot sector, the E820 buffer, this
+  kernel itself) is simply never marked free, since the whole kernel is far
+  smaller than 1 MB.
+- `pmm_alloc_frame()` does a first-fit scan of the bitmap for a clear bit,
+  sets it, and returns that frame's physical address; `pmm_free_frame()`
+  clears the bit back. Both are O(1) bit operations plus a linear scan.
+- A self-test runs once at boot (`kernel/kernel.c`, `pmm_selftest()`):
+  it allocates 100 frames, checks none of them are the same address, frees
+  them all, and confirms the free-frame count returns to exactly what it
+  was before - proving there's no leak.
+
+**Real bug found while testing this stage:** the bootloader's
+`load_kernel` step sets `ES=0x1000` to load the kernel at physical
+`0x10000`, and the first version of `detect_memory` never reset `ES` back
+to 0 before writing E820 entries via `ES:DI`. That silently wrote the whole
+memory map to physical `0x18004` instead of `0x8004`, so the kernel read
+nothing but zeros. Fixed by having `detect_memory` save/reset/restore `ES`
+itself, instead of assuming the caller's segment state.
+
+**New/changed shell commands:**
+
+| Command   | Arguments | Behaviour                                              |
+|-----------|-----------|----------------------------------------------------------|
+| `mem`     | -         | Prints the real BIOS E820 memory map (region/size/type)   |
+| `meminfo` | -         | Prints total/used/free physical memory, in MB and frames  |
+
+### How to test Stage 3
+
+1. `make run` and watch the top line right under the banner: it should say
+   `[PMM self-test] allocate/free 100 frames: OK, no leaks` in green. If it
+   ever says `FAILED`, something is double-allocating or leaking frames.
+2. `mem` - should list several real regions (e.g. `0x0 - 0x9fc00 : Usable`,
+   some `Reserved` regions, then a large `Usable` region starting at
+   `0x100000`) - not the old Stage 0 hard-coded guess.
+3. `meminfo` - for a 32 MB QEMU VM, expect roughly `Total: 30 MB`,
+   `Used: 0 MB`, `Free: 30 MB` (the ~1 MB below 1 MB, and a little near the
+   very top, are reserved and not counted).
+4. Run `meminfo` again - the numbers should be identical to step 3,
+   confirming nothing leaked between commands.
 5. `halt` - should still stop the CPU cleanly with no crash or reboot.
 
 No optional/bonus extensions are implemented in this stage.
