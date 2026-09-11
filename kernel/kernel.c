@@ -1,5 +1,5 @@
 /* =============================================================================
- * SENG21213-OS :: Main Kernel  (Stage 3 - Physical Memory Manager)
+ * SENG21213-OS :: Main Kernel  (Stage 4 - RAM Disk File System)
  * File   : kernel/kernel.c
  *
  * PURPOSE
@@ -10,16 +10,18 @@
  *        timer tick (L09) so the round-robin scheduler can pre-empt
  *     4. Builds the physical memory bitmap from the E820 map boot.asm left
  *        behind, and self-tests it (L11)
- *     5. Creates two background demo processes to prove pre-emption works
- *     6. Prints a splash screen
- *     7. Runs a minimal interactive shell ("ksh"), itself scheduled as PCB 0,
- *        which can also launch the Stage 2 thread/mutex/semaphore demos
+ *     5. Formats the RAM disk file system and self-tests it (L12)
+ *     6. Creates two background demo processes to prove pre-emption works
+ *     7. Prints a splash screen
+ *     8. Runs a minimal interactive shell ("ksh"), itself scheduled as PCB 0,
+ *        which can also launch the Stage 2 thread/mutex/semaphore demos and
+ *        the Stage 4 file commands (ls/touch/cat/write/rm)
  *
- * ASSIGNMENT MILESTONES  (what YOU will add in later lectures)
+ * ASSIGNMENT MILESTONES
  *   Lecture  9  - Process Management  ->  process.h / process.c / scheduler.c        [DONE]
  *   Lecture 10  - Threads & Sync      ->  thread.c / mutex.c / semaphore.c            [DONE]
  *   Lecture 11  - Memory Management   ->  pmm.h / pmm.c (E820 + bitmap frame alloc)   [DONE]
- *   Lecture 12  - File System         ->  fs.h      / fs.c
+ *   Lecture 12  - File System         ->  ramdisk.h/.c + fs.h/.c                      [DONE]
  *
  * CODING CONVENTION
  *   - Prefix kernel-internal functions with k_ (e.g. k_strcmp)
@@ -36,6 +38,8 @@
 #include "mutex.h"
 #include "semaphore.h"
 #include "pmm.h"
+#include "ramdisk.h"
+#include "fs.h"
 #include "../include/types.h"
 
 /* ---------------------------------------------------------------------------
@@ -53,6 +57,11 @@ static void cmd_ps(void);
 static void cmd_race(void);
 static void cmd_producer(void);
 static void cmd_meminfo(void);
+static void cmd_ls(void);
+static void cmd_touch(const char *args);
+static void cmd_cat(const char *args);
+static void cmd_write(const char *args);
+static void cmd_rm(const char *args);
 
 /* ---------------------------------------------------------------------------
  * Utility: minimal string helpers (no libc in a freestanding kernel!)
@@ -105,7 +114,7 @@ static void print_splash(void) {
                    VGA_YELLOW, VGA_BLACK);
 
     vga_set_cursor(2, 2);
-    vga_puts_color("  Stage 3: Physical Memory Manager", VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts_color("  Stage 4: RAM Disk File System", VGA_LIGHT_CYAN, VGA_BLACK);
 
     vga_set_cursor(3, 2);
     vga_puts_color("  Faculty of Engineering - Department of Software Engineering",
@@ -132,8 +141,8 @@ static void print_splash(void) {
     vga_puts("Threads & Sync      - kernel threads, mutex, semaphore          (done)\n");
     vga_puts_color("    [L11] ", VGA_LIGHT_GREEN, VGA_BLACK);
     vga_puts("Memory Management   - E820 map, bitmap frame allocator          (done)\n");
-    vga_puts_color("    [L12] ", VGA_YELLOW, VGA_BLACK);
-    vga_puts("File System         - RAM disk, FAT-like directory structure\n");
+    vga_puts_color("    [L12] ", VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_puts("File System         - RAM disk, bitmap/inode file system      (done)\n");
     vga_puts("\n");
 
     /* Static labels for the two background demo processes (see
@@ -163,11 +172,14 @@ static void cmd_help(void) {
     vga_puts("  ps      - [L09] List processes (pid/state/esp)\n");
     vga_puts("  race    - [L10] Race-condition demo, with/without a mutex\n");
     vga_puts("  producer- [L10] Producer-consumer demo (bounded buffer)\n");
+    vga_puts("  ls      - [L12] List files on the RAM disk\n");
+    vga_puts("  touch   - [L12] touch <name>          - create an empty file\n");
+    vga_puts("  cat     - [L12] cat <name>            - print a file's contents\n");
+    vga_puts("  write   - [L12] write <name> <text>   - overwrite a file's contents\n");
+    vga_puts("  rm      - [L12] rm <name>             - delete a file\n");
     vga_puts_color("\n  Milestones (to implement):\n", VGA_LIGHT_CYAN, VGA_BLACK);
     vga_puts("  kill    - [L09] Terminate a process\n");
-    vga_puts("  threads - [L10] List kernel threads\n");
-    vga_puts("  ls      - [L12] List files\n");
-    vga_puts("  cat     - [L12] Print file contents\n\n");
+    vga_puts("  threads - [L10] List kernel threads\n\n");
 }
 
 static void cmd_clear(void) {
@@ -231,10 +243,130 @@ static void cmd_meminfo(void) {
     vga_printf("  Free  : %d MB  (%d frames)\n\n", (free_ * 4) / 1024, free_);
 }
 
+/* L12 - lists every file on the RAM disk, with its size */
+static void cmd_ls(void) {
+    static char names[FS_MAX_DIRENTS][FS_MAX_NAME];
+    static uint32_t sizes[FS_MAX_DIRENTS];
+    uint32_t n = fs_list(names, sizes, FS_MAX_DIRENTS);
+
+    vga_puts_color("\n  Files\n", VGA_YELLOW, VGA_BLACK);
+    vga_puts("  ---------------------------------------------\n");
+    if (n == 0) {
+        vga_puts("  (no files)\n\n");
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        vga_puts("  ");
+        vga_puts(names[i]);
+        vga_puts("  (");
+        vga_printf("%d", sizes[i]);
+        vga_puts(" bytes)\n");
+    }
+    vga_puts("\n");
+}
+
+/* L12 - touch <name>: creates an empty file if it doesn't already exist */
+static void cmd_touch(const char *args) {
+    args = k_ltrim(args);
+    if (k_strlen(args) == 0) {
+        vga_puts_color("  Usage: touch <name>\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+
+    int fd = fs_open(args, 0);
+    if (fd >= 0) {
+        fs_close(fd);
+        vga_puts("  File already exists.\n");
+        return;
+    }
+
+    fd = fs_open(args, 1);
+    if (fd < 0) {
+        vga_puts_color("  Error: could not create file (table full?)\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+    fs_close(fd);
+    vga_puts("  Created.\n");
+}
+
+/* L12 - cat <name>: prints a file's whole contents */
+static void cmd_cat(const char *args) {
+    args = k_ltrim(args);
+    if (k_strlen(args) == 0) {
+        vga_puts_color("  Usage: cat <name>\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+
+    int fd = fs_open(args, 0);
+    if (fd < 0) {
+        vga_puts_color("  File not found: ", VGA_LIGHT_RED, VGA_BLACK);
+        vga_puts(args);
+        vga_puts("\n");
+        return;
+    }
+
+    static char buf[FS_MAX_FILE_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_FILE_SIZE);
+    fs_close(fd);
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+
+    vga_puts("\n");
+    vga_puts(buf);
+    vga_puts("\n\n");
+}
+
+/* L12 - write <name> <text>: overwrites (or creates) a file with <text> */
+static void cmd_write(const char *args) {
+    args = k_ltrim(args);
+    if (k_strlen(args) == 0) {
+        vga_puts_color("  Usage: write <name> <text>\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+
+    char fname[FS_MAX_NAME];
+    uint32_t i = 0;
+    while (args[i] && args[i] != ' ' && i < FS_MAX_NAME - 1) { fname[i] = args[i]; i++; }
+    fname[i] = '\0';
+
+    const char *text = k_ltrim(args + i);
+
+    int fd = fs_open(fname, 1);
+    if (fd < 0) {
+        vga_puts_color("  Error: could not open/create file\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+
+    int written = fs_write(fd, text, k_strlen(text));
+    fs_close(fd);
+
+    vga_printf("  Wrote %d", written);
+    vga_puts(" bytes to ");
+    vga_puts(fname);
+    vga_puts("\n");
+}
+
+/* L12 - rm <name>: deletes a file */
+static void cmd_rm(const char *args) {
+    args = k_ltrim(args);
+    if (k_strlen(args) == 0) {
+        vga_puts_color("  Usage: rm <name>\n", VGA_LIGHT_RED, VGA_BLACK);
+        return;
+    }
+
+    if (fs_unlink(args) == 0) {
+        vga_puts("  Removed.\n");
+    } else {
+        vga_puts_color("  File not found: ", VGA_LIGHT_RED, VGA_BLACK);
+        vga_puts(args);
+        vga_puts("\n");
+    }
+}
+
 /* L08 - prints the kernel name and version string for this stage */
 static void cmd_version(void) {
-    vga_puts("\n  SENG21213-OS  v0.4-stage3\n");
-    vga_puts("  Stage 3 : Physical Memory Manager\n\n");
+    vga_puts("\n  SENG21213-OS  v0.5-stage4\n");
+    vga_puts("  Stage 4 : RAM Disk File System\n\n");
 }
 
 /* L08 - colour <fg> <bg>, both 0-15 (see vga.h vga_color_t) */
@@ -481,11 +613,28 @@ static void shell_run(void) {
             continue;
         }
 
+        if (k_strcmp(cmd, "ls") == 0) { cmd_ls(); continue; }
+
+        if (k_strcmp(cmd, "touch") == 0 || k_strncmp(cmd, "touch ", 6) == 0) {
+            cmd_touch(cmd + 5);
+            continue;
+        }
+        if (k_strcmp(cmd, "cat") == 0 || k_strncmp(cmd, "cat ", 4) == 0) {
+            cmd_cat(cmd + 3);
+            continue;
+        }
+        if (k_strcmp(cmd, "write") == 0 || k_strncmp(cmd, "write ", 6) == 0) {
+            cmd_write(cmd + 5);
+            continue;
+        }
+        if (k_strcmp(cmd, "rm") == 0 || k_strncmp(cmd, "rm ", 3) == 0) {
+            cmd_rm(cmd + 2);
+            continue;
+        }
+
         /* Milestone stubs */
         if (k_strcmp(cmd, "kill")    == 0 ||
-            k_strcmp(cmd, "threads") == 0 ||
-            k_strcmp(cmd, "ls")      == 0 ||
-            k_strcmp(cmd, "cat")     == 0) {
+            k_strcmp(cmd, "threads") == 0) {
             vga_puts_color("  [TODO] This command is not yet implemented.\n",
                            VGA_YELLOW, VGA_BLACK);
             vga_puts("  Implement it as part of your lecture assignment.\n");
@@ -529,6 +678,56 @@ static void pmm_selftest(void) {
     }
 }
 
+/* L12 - creates, writes, reads back and deletes 5 files, verifying the
+ * content read back matches what was written and that a deleted file is
+ * really gone. Runs once at boot, same idea as the PMM self-test above. */
+#define FS_SELFTEST_FILES 5
+
+static void fs_selftest(void) {
+    static const char *names[FS_SELFTEST_FILES] = {
+        "f1.txt", "f2.txt", "f3.txt", "f4.txt", "f5.txt"
+    };
+    static const char *contents[FS_SELFTEST_FILES] = {
+        "Hello from file one",
+        "Second test file",
+        "Third one here",
+        "Fourth file content",
+        "Fifth and final file"
+    };
+    int ok = 1;
+    char buf[64];
+
+    for (int i = 0; i < FS_SELFTEST_FILES && ok; i++) {
+        int fd = fs_open(names[i], 1);
+        if (fd < 0) { ok = 0; break; }
+        fs_write(fd, contents[i], k_strlen(contents[i]));
+        fs_close(fd);
+    }
+
+    for (int i = 0; i < FS_SELFTEST_FILES && ok; i++) {
+        int fd = fs_open(names[i], 0);
+        if (fd < 0) { ok = 0; break; }
+        int n = fs_read(fd, buf, sizeof(buf) - 1);
+        fs_close(fd);
+        if (n < 0) { ok = 0; break; }
+        buf[n] = '\0';
+        if (k_strcmp(buf, contents[i]) != 0) { ok = 0; break; }
+    }
+
+    for (int i = 0; i < FS_SELFTEST_FILES; i++) fs_unlink(names[i]);
+
+    for (int i = 0; i < FS_SELFTEST_FILES && ok; i++) {
+        if (fs_open(names[i], 0) >= 0) { ok = 0; break; }   /* should be gone */
+    }
+
+    if (ok) {
+        vga_puts_color("  [FS self-test] create/write/read/delete 5 files: OK\n",
+                       VGA_LIGHT_GREEN, VGA_BLACK);
+    } else {
+        vga_puts_color("  [FS self-test] FAILED\n", VGA_LIGHT_RED, VGA_BLACK);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Kernel entry point - called from kernel_entry.asm
  * --------------------------------------------------------------------------*/
@@ -544,6 +743,9 @@ void kernel_main(void) {
     idt_init();
     pit_init(100);          /* 100 Hz -> a tick every 10 ms */
     pmm_init();              /* L11 - parse the E820 map, build the bitmap */
+    pmm_reserve_range(RAMDISK_PHYS_ADDR, RAMDISK_SIZE);  /* L12 - the RAM disk
+                              * lives at a fixed address, not in the PMM pool */
+    fs_init();               /* L12 - format the RAM disk file system */
     process_init();
     scheduler_init();
 
@@ -556,6 +758,7 @@ void kernel_main(void) {
 
     print_splash();
     pmm_selftest();
+    fs_selftest();
     shell_run();
 
     /* Should never reach here */

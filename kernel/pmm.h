@@ -15,6 +15,11 @@ void     pmm_init(void);
 uint32_t pmm_alloc_frame(void);       /* returns a physical address, or 0 if out of memory */
 void     pmm_free_frame(uint32_t paddr);
 
+/* Marks every frame in [start_addr, start_addr+length) as permanently used,
+ * without counting against pmm_used_frames() - for fixed-address structures
+ * (like the Stage 4 RAM disk) that live outside the normal allocator. */
+void     pmm_reserve_range(uint32_t start_addr, uint32_t length);
+
 uint32_t pmm_total_frames(void);
 uint32_t pmm_used_frames(void);
 uint32_t pmm_free_frames(void);

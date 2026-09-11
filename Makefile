@@ -55,10 +55,9 @@ KERNEL_C_SRCS  := kernel/kernel.c \
                    kernel/thread.c \
                    kernel/mutex.c \
                    kernel/semaphore.c \
-                   kernel/pmm.c
-
-# Add your new source files below as the course progresses:
-# Lecture 12: kernel/fs.c
+                   kernel/pmm.c \
+                   kernel/ramdisk.c \
+                   kernel/fs.c
 
 KERNEL_C_OBJS  := $(patsubst kernel/%.c, build/%.o, $(KERNEL_C_SRCS))
 KERNEL_ELF     := build/kernel.elf

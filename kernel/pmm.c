@@ -85,6 +85,18 @@ void pmm_free_frame(uint32_t paddr) {
     }
 }
 
+void pmm_reserve_range(uint32_t start_addr, uint32_t length) {
+    uint32_t first = start_addr / PMM_FRAME_SIZE;
+    uint32_t last  = (start_addr + length + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE;  /* exclusive, rounded up */
+    if (last > MAX_FRAMES) last = MAX_FRAMES;
+    for (uint32_t f = first; f < last && f < frame_limit; f++) {
+        if (!bitmap_test(f)) {
+            bitmap_set(f);
+            used_frames_count++;   /* keep used/free accounting consistent */
+        }
+    }
+}
+
 uint32_t pmm_total_frames(void) {
     return (frame_limit > PMM_START_FRAME) ? (frame_limit - PMM_START_FRAME) : 0;
 }

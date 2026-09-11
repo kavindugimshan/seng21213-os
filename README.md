@@ -28,7 +28,9 @@ seng21213-os/
 │   ├── thread.c / thread.h     # kernel threads: thread_create(fn, arg) (Stage 2)
 │   ├── mutex.c / mutex.h       # blocking mutex_lock()/mutex_unlock()
 │   ├── semaphore.c / semaphore.h  # counting semaphore sem_wait()/sem_signal()
-│   └── pmm.c / pmm.h           # bitmap physical frame allocator (Stage 3)
+│   ├── pmm.c / pmm.h           # bitmap physical frame allocator (Stage 3)
+│   ├── ramdisk.c / ramdisk.h   # 1 MB RAM disk block device (Stage 4)
+│   └── fs.c / fs.h             # superblock/bitmap/inode flat file system
 ├── include/
 │   └── types.h           # Primitive integer types (freestanding, no libc)
 ├── linker.ld             # Linker script - places the kernel at 0x10000
@@ -44,7 +46,7 @@ seng21213-os/
 | Stage 1 (L09)     | Process Table & Scheduler    | `v0.2-stage1`   | Done |
 | Stage 2 (L10)     | Threads, Mutex & Semaphore   | `v0.3-stage2`   | Done |
 | Stage 3 (L11)     | Physical Memory Manager      | `v0.4-stage3`   | Done |
-| Stage 4 (L12)     | RAM Disk File System         | `v0.5-stage4`   | Pending |
+| Stage 4 (L12)     | RAM Disk File System         | `v0.5-stage4`   | Done |
 
 ## Building & Running
 
@@ -295,11 +297,81 @@ itself, instead of assuming the caller's segment state.
    some `Reserved` regions, then a large `Usable` region starting at
    `0x100000`) - not the old Stage 0 hard-coded guess.
 3. `meminfo` - for a 32 MB QEMU VM, expect roughly `Total: 30 MB`,
-   `Used: 0 MB`, `Free: 30 MB` (the ~1 MB below 1 MB, and a little near the
-   very top, are reserved and not counted).
+   `Used: 1 MB`, `Free: 29 MB` (the ~1 MB below 1 MB, and a little near the
+   very top, are reserved by the BIOS and not counted; the 1 MB "used" is
+   the Stage 4 RAM disk, reserved via `pmm_reserve_range()`).
 4. Run `meminfo` again - the numbers should be identical to step 3,
    confirming nothing leaked between commands.
 5. `halt` - should still stop the CPU cleanly with no crash or reboot.
+
+No optional/bonus extensions are implemented in this stage.
+
+## Stage 4: RAM Disk File System
+
+Stage 4 adds a small flat file system on top of a 1 MB in-memory "disk".
+
+**How it fits together:**
+
+- `kernel/ramdisk.c/.h` is the block device: a 1 MB byte array, read and
+  written one 4 KB block at a time. It lives at a **fixed physical
+  address** (`0x200000`, 2 MB), not as a normal `.bss` variable - a
+  1 MB static array inside the kernel's own image would grow straight past
+  the stack (the kernel loads at `0x10000` and the stack starts at only
+  `0x90000`, just 512 KB away) and corrupt it. `kernel_main()` tells the
+  Stage 3 allocator about this via `pmm_reserve_range()`, so
+  `pmm_alloc_frame()` can never hand those frames out to anything else.
+- `kernel/fs.c/.h` lays the file system out on top of that block device
+  exactly as specified: block 0 is the superblock (magic number + layout),
+  block 1 is a flat directory (`{name[28], inode}` entries), blocks 2 and 3
+  are the block and inode bitmaps, block 4 is the inode table, and blocks 5
+  onward hold file data. Each inode has 8 direct block pointers, so
+  8 x 4 KB = 32 KB is the largest file it can hold.
+- `fs_open/fs_read/fs_write/fs_close/fs_unlink` are the POSIX-style API the
+  shell commands are built on. To keep things simple, there is no
+  persistent per-file read/write position: `fs_read()` always reads from
+  the start of the file, and `fs_write()` always replaces the whole file -
+  that's all `cat`/`write` ever need, and it avoids an open-file-table this
+  project has no other use for.
+- A self-test runs once at boot (`fs_selftest()` in `kernel/kernel.c`):
+  it creates 5 files, writes different content to each, reads every one
+  back and checks it matches, deletes all 5, then confirms they're really
+  gone.
+
+**Real bug found while testing this stage:** the first version put the
+1 MB RAM disk as a plain `static uint8_t disk[1024*1024]` in `ramdisk.c`.
+That grew the kernel's `.bss` segment straight past the boot-time stack
+(`0x90000`), and the machine never even reached the splash screen (QEMU
+just showed a black, uninitialised display). Fixed by pointing the RAM
+disk at a fixed high physical address instead of letting the linker place
+it inside the kernel image, and reserving that range in the PMM.
+
+**New shell commands:**
+
+| Command | Arguments        | Behaviour                                        |
+|---------|-------------------|----------------------------------------------------|
+| `ls`    | -                 | Lists every file on the RAM disk, with its size      |
+| `touch` | `<name>`          | Creates an empty file (no-op if it already exists)   |
+| `cat`   | `<name>`          | Prints a file's whole contents                       |
+| `write` | `<name> <text>`   | Overwrites (or creates) a file with `<text>`         |
+| `rm`    | `<name>`          | Deletes a file                                       |
+
+### How to test Stage 4
+
+1. `make run` and check the boot log shows
+   `[FS self-test] create/write/read/delete 5 files: OK` in green.
+2. `ls` - should say `(no files)` on a fresh boot.
+3. `touch demo.txt` then `ls` - `demo.txt` should appear with `(0 bytes)`.
+4. `write demo.txt Hello from the RAM disk` then `ls` - size should now be
+   non-zero.
+5. `cat demo.txt` - should print exactly `Hello from the RAM disk`.
+6. `rm demo.txt` then `ls` - the file should be gone; `cat demo.txt`
+   afterward should report "File not found".
+7. Repeat steps 3-6 (or similar) for at least 5 different files, running
+   `ls` after each operation, to manually exercise create/write/read/delete
+   the way the assignment's verification step describes.
+8. `meminfo` - `Used` should include the 1 MB (256 frames) reserved for the
+   RAM disk.
+9. `halt` - should still stop the CPU cleanly with no crash or reboot.
 
 No optional/bonus extensions are implemented in this stage.
 
