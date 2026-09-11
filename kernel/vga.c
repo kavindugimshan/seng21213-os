@@ -122,6 +122,11 @@ void vga_set_cursor(int row, int col) {
     update_hw_cursor();
 }
 
+void vga_put_at(int row, int col, char c, vga_color_t fg, vga_color_t bg) {
+    if (row < 0 || row >= VGA_ROWS || col < 0 || col >= VGA_COLS) return;
+    vga_write_cell(row, col, c, VGA_ATTR(fg, bg));
+}
+
 /* Minimal vga_printf: supports %s, %c, %d, %u, %x */
 static void print_uint(uint32_t n, int base) {
     char buf[32];

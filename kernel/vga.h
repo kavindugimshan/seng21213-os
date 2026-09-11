@@ -50,6 +50,11 @@ void vga_puts_color(const char *str, vga_color_t fg, vga_color_t bg);
 void vga_set_cursor(int row, int col);
 void vga_printf(const char *fmt, ...);
 
+/* Writes one cell directly, without moving the shared cursor. Used by
+ * Stage 1's background demo processes so they don't disturb the shell
+ * prompt while running concurrently with it. */
+void vga_put_at(int row, int col, char c, vga_color_t fg, vga_color_t bg);
+
 /* Student extension hook - implement in a later lecture */
 void vga_draw_box(int row, int col, int height, int width, vga_color_t color);
 

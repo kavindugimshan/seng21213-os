@@ -40,15 +40,20 @@ endif
 BOOT_SRC  := boot/boot.asm
 BOOT_BIN  := boot/boot.bin
 
-KERNEL_ASM_SRC := kernel/kernel_entry.asm
-KERNEL_ASM_OBJ := build/kernel_entry.o
+# kernel_entry.asm MUST be first: boot.asm far-jumps straight to 0x10000,
+# so _start (its first instruction) has to be the very first thing in .text.
+KERNEL_ASM_SRCS := kernel/kernel_entry.asm kernel/switch.asm
+KERNEL_ASM_OBJS := $(patsubst kernel/%.asm, build/%.o, $(KERNEL_ASM_SRCS))
 
 KERNEL_C_SRCS  := kernel/kernel.c \
                    kernel/vga.c    \
-                   kernel/keyboard.c
+                   kernel/keyboard.c \
+                   kernel/process.c \
+                   kernel/scheduler.c \
+                   kernel/idt.c \
+                   kernel/pit.c
 
 # Add your new source files below as the course progresses:
-# Lecture 09: kernel/process.c kernel/scheduler.c
 # Lecture 10: kernel/thread.c  kernel/mutex.c
 # Lecture 11: kernel/pmm.c     kernel/vmm.c
 # Lecture 12: kernel/fs.c
@@ -78,9 +83,9 @@ $(BOOT_BIN): $(BOOT_SRC)
 	$(AS) -f bin $< -o $@
 
 # ---------------------------------------------------------------------------
-# Kernel: Assembly object
+# Kernel: Assembly objects
 # ---------------------------------------------------------------------------
-$(KERNEL_ASM_OBJ): $(KERNEL_ASM_SRC)
+build/%.o: kernel/%.asm
 	@mkdir -p build
 	@echo "  [AS]  $<"
 	$(AS) $(ASFLAGS) $< -o $@
@@ -96,7 +101,7 @@ build/%.o: kernel/%.c
 # ---------------------------------------------------------------------------
 # Link kernel ELF, then extract flat binary
 # ---------------------------------------------------------------------------
-$(KERNEL_ELF): $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJS)
+$(KERNEL_ELF): $(KERNEL_ASM_OBJS) $(KERNEL_C_OBJS)
 	@echo "  [LD]  $@"
 	$(LD) $(LDFLAGS) -T linker.ld $^ -o $@
 

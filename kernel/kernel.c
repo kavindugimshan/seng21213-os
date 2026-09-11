@@ -1,16 +1,19 @@
 /* =============================================================================
- * SENG21213-OS :: Main Kernel  (Stage 0 - Foundations)
+ * SENG21213-OS :: Main Kernel  (Stage 1 - Process Table & Scheduler)
  * File   : kernel/kernel.c
  *
  * PURPOSE
  *   This is the heart of your operating system. Right now it:
  *     1. Initialises VGA text-mode display
  *     2. Initialises the keyboard driver
- *     3. Prints a splash screen
- *     4. Runs a minimal interactive shell ("ksh")
+ *     3. Sets up the IDT, remaps the PIC and programs the PIT for a 100 Hz
+ *        timer tick (L09) so the round-robin scheduler can pre-empt
+ *     4. Creates two background demo processes to prove pre-emption works
+ *     5. Prints a splash screen
+ *     6. Runs a minimal interactive shell ("ksh"), itself scheduled as PCB 0
  *
  * ASSIGNMENT MILESTONES  (what YOU will add in later lectures)
- *   Lecture  9  - Process Management  ->  process.h / process.c / scheduler.c
+ *   Lecture  9  - Process Management  ->  process.h / process.c / scheduler.c   [DONE]
  *   Lecture 10  - Threads             ->  thread.h  / thread.c
  *   Lecture 11  - Memory Management   ->  pmm.h     / pmm.c / vmm.c
  *   Lecture 12  - File System         ->  fs.h      / fs.c
@@ -23,6 +26,9 @@
 
 #include "vga.h"
 #include "keyboard.h"
+#include "process.h"
+#include "idt.h"
+#include "pit.h"
 #include "../include/types.h"
 
 /* ---------------------------------------------------------------------------
@@ -36,6 +42,7 @@ static void cmd_mem(void);
 static void cmd_version(void);
 static void cmd_colour(const char *args);
 static void cmd_halt(void);
+static void cmd_ps(void);
 
 /* ---------------------------------------------------------------------------
  * Utility: minimal string helpers (no libc in a freestanding kernel!)
@@ -88,7 +95,7 @@ static void print_splash(void) {
                    VGA_YELLOW, VGA_BLACK);
 
     vga_set_cursor(2, 2);
-    vga_puts_color("  Stage 0: Kernel Foundations", VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts_color("  Stage 1: Process Table & Scheduler", VGA_LIGHT_CYAN, VGA_BLACK);
 
     vga_set_cursor(3, 2);
     vga_puts_color("  Faculty of Engineering - Department of Software Engineering",
@@ -108,9 +115,9 @@ static void print_splash(void) {
     vga_puts("  from bare metal. There is no Linux or Windows underneath - only\n");
     vga_puts("  the code you and your team write.\n");
     vga_puts("\n");
-    vga_puts("  Assignment milestones to implement:\n");
-    vga_puts_color("    [L09] ", VGA_YELLOW, VGA_BLACK);
-    vga_puts("Process Management  - PCB, ready queue, round-robin scheduler\n");
+    vga_puts("  Assignment milestones:\n");
+    vga_puts_color("    [L09] ", VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_puts("Process Management  - PCB, ready queue, round-robin scheduler   (done)\n");
     vga_puts_color("    [L10] ", VGA_YELLOW, VGA_BLACK);
     vga_puts("Threads & Sync      - kernel threads, mutex, semaphore\n");
     vga_puts_color("    [L11] ", VGA_YELLOW, VGA_BLACK);
@@ -118,6 +125,14 @@ static void print_splash(void) {
     vga_puts_color("    [L12] ", VGA_YELLOW, VGA_BLACK);
     vga_puts("File System         - RAM disk, FAT-like directory structure\n");
     vga_puts("\n");
+
+    /* Static labels for the two background demo processes (see
+     * demo_process_a/b below) - the spinner characters themselves are
+     * drawn directly via vga_put_at() so they don't disturb this cursor. */
+    vga_set_cursor(1, 66);
+    vga_puts_color("P1:", VGA_LIGHT_GREY, VGA_BLACK);
+    vga_set_cursor(1, 73);
+    vga_puts_color("P2:", VGA_LIGHT_GREY, VGA_BLACK);
 }
 
 /* ---------------------------------------------------------------------------
@@ -134,8 +149,8 @@ static void cmd_help(void) {
     vga_puts("  version - Show kernel name and version\n");
     vga_puts("  colour  - colour <fg> <bg>  (values 0-15)\n");
     vga_puts("  halt    - Disable interrupts and halt the CPU\n");
+    vga_puts("  ps      - [L09] List processes (pid/state/esp)\n");
     vga_puts_color("\n  Milestones (to implement):\n", VGA_LIGHT_CYAN, VGA_BLACK);
-    vga_puts("  ps      - [L09] List processes\n");
     vga_puts("  kill    - [L09] Terminate a process\n");
     vga_puts("  threads - [L10] List kernel threads\n");
     vga_puts("  free    - [L11] Show free memory\n");
@@ -215,6 +230,36 @@ static void cmd_halt(void) {
     }
 }
 
+/* L09 - lists every PCB (pid/state/esp); implemented in process.c */
+static void cmd_ps(void) {
+    process_list();
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage 1 demo: two background processes that prove pre-emptive round-robin
+ * scheduling is actually working. Each spins a small character through
+ * "|/-\" at a fixed screen cell, busy-waiting a different number of
+ * iterations between updates - so P1 visibly spins faster than P2, and
+ * both keep spinning independently while you use the shell.
+ *
+ * They write ONLY through vga_put_at(), never vga_puts()/vga_printf(),
+ * because those move the single shared cursor that the shell prompt also
+ * relies on - two processes fighting over one cursor would corrupt the
+ * screen the moment the scheduler pre-empts one mid-line.
+ * --------------------------------------------------------------------------*/
+static void demo_spin(int row, int col, vga_color_t fg, long delay_iters) {
+    static const char spinner[4] = { '|', '/', '-', '\\' };
+    int idx = 0;
+    for (;;) {
+        vga_put_at(row, col, spinner[idx % 4], fg, VGA_BLACK);
+        idx++;
+        for (volatile long i = 0; i < delay_iters; i++) { }
+    }
+}
+
+static void demo_process_a(void) { demo_spin(1, 69, VGA_LIGHT_GREEN, 2000000L); }
+static void demo_process_b(void) { demo_spin(1, 76, VGA_LIGHT_CYAN,  6000000L); }
+
 /* ---------------------------------------------------------------------------
  * Shell process
  * --------------------------------------------------------------------------*/
@@ -240,6 +285,7 @@ static void shell_run(void) {
         if (k_strcmp(cmd, "mem")     == 0) { cmd_mem();     continue; }
         if (k_strcmp(cmd, "version") == 0) { cmd_version(); continue; }
         if (k_strcmp(cmd, "halt")    == 0) { cmd_halt();    continue; }
+        if (k_strcmp(cmd, "ps")      == 0) { cmd_ps();      continue; }
 
         if (k_strncmp(cmd, "echo ", 5) == 0) {
             cmd_echo(k_ltrim(cmd + 5));
@@ -252,8 +298,7 @@ static void shell_run(void) {
         }
 
         /* Milestone stubs */
-        if (k_strcmp(cmd, "ps")      == 0 ||
-            k_strcmp(cmd, "kill")    == 0 ||
+        if (k_strcmp(cmd, "kill")    == 0 ||
             k_strcmp(cmd, "threads") == 0 ||
             k_strcmp(cmd, "free")    == 0 ||
             k_strcmp(cmd, "ls")      == 0 ||
@@ -276,6 +321,24 @@ static void shell_run(void) {
 void kernel_main(void) {
     vga_init();
     kb_init();
+
+    /* L09 - bring up interrupts and the scheduler before enabling IF.
+     * Order matters: the IDT/PIT must be programmed, and the process
+     * table + ready queue must already contain PCB 0 (this very
+     * execution context) and the two demo processes, before we turn
+     * interrupts on - otherwise IRQ0 could fire into an empty scheduler. */
+    idt_init();
+    pit_init(100);          /* 100 Hz -> a tick every 10 ms */
+    process_init();
+    scheduler_init();
+
+    pcb_t *pa = process_create(demo_process_a);
+    pcb_t *pb = process_create(demo_process_b);
+    if (pa) scheduler_add(pa);
+    if (pb) scheduler_add(pb);
+
+    __asm__ __volatile__("sti");   /* pre-emption is now live */
+
     print_splash();
     shell_run();
 

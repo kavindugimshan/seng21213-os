@@ -19,6 +19,11 @@ seng21213-os/
 │   ├── kernel.c          # Main kernel: shell loop, command dispatch
 │   ├── vga.c / vga.h     # VGA 80x25 text-mode driver
 │   ├── keyboard.c / .h   # PS/2 keyboard polling driver
+│   ├── process.h / process.c   # PCB table + process_create() (Stage 1)
+│   ├── scheduler.c             # Round-robin ready queue + timer tick handler
+│   ├── switch.asm              # IRQ0 context-switch stub (PUSHAD/POPAD)
+│   ├── idt.c / idt.h           # IDT + 8259 PIC remap (needed for IRQ0)
+│   └── pit.c / pit.h           # i8253 PIT driver (100 Hz timer tick)
 ├── include/
 │   └── types.h           # Primitive integer types (freestanding, no libc)
 ├── linker.ld             # Linker script - places the kernel at 0x10000
@@ -31,7 +36,7 @@ seng21213-os/
 | Stage / Lecture | Milestone                    | Tag             | Status |
 |------------------|------------------------------|-----------------|--------|
 | Stage 0 (L07-L08) | Boot, VGA & Shell            | `v0.1-stage0`   | Done |
-| Stage 1 (L09)     | Process Table & Scheduler    | `v0.2-stage1`   | Pending |
+| Stage 1 (L09)     | Process Table & Scheduler    | `v0.2-stage1`   | Done |
 | Stage 2 (L10)     | Threads, Mutex & Semaphore   | `v0.3-stage2`   | Pending |
 | Stage 3 (L11)     | Physical Memory Manager      | `v0.4-stage3`   | Pending |
 | Stage 4 (L12)     | RAM Disk File System         | `v0.5-stage4`   | Pending |
@@ -94,7 +99,7 @@ repository.
 | `about`  | -              | Extra: prints build/architecture info                    |
 | `mem`    | -              | Extra: stub memory map (real PMM added in Stage 3)       |
 
-`ps`, `kill`, `threads`, `free`, `ls`, `cat` are recognised but print a
+`kill`, `threads`, `free`, `ls`, `cat` are recognised but print a
 "not yet implemented" message - they are wired up in later stages.
 
 ### How to test Stage 0
@@ -107,6 +112,60 @@ repository.
 6. `clear` - screen should blank and the cursor return to the top-left.
 7. `halt` - should print a message, then the CPU stops (QEMU window freezes,
    no reboot or crash).
+
+No optional/bonus extensions are implemented in this stage.
+
+## Stage 1: Process Table & Scheduler
+
+Stage 1 adds pre-emptive multitasking: a fixed-size process table (PCBs), a
+round-robin scheduler driven by a 100 Hz hardware timer, and a real context
+switch between process stacks.
+
+**How it fits together:**
+
+- `kernel/idt.c` builds a minimal Interrupt Descriptor Table and remaps the
+  8259 PIC so IRQ0 (the timer) is delivered on interrupt vector `0x20`,
+  without colliding with CPU exception vectors. Every other IRQ line is
+  masked off - the keyboard is still polled (Stage 0), not interrupt-driven.
+- `kernel/pit.c` programs the i8253 timer to fire IRQ0 every 10 ms (100 Hz).
+- `kernel/switch.asm` is the IRQ0 handler: it saves the running process's
+  registers (`pushad`), calls `scheduler_tick()` in C with the current stack
+  pointer, loads whatever stack pointer that function returns, sends the
+  End-Of-Interrupt to the PIC, then restores registers (`popad`) and returns
+  (`iret`) - possibly into a completely different process.
+- `kernel/process.c` owns the static `pcb_table[MAX_PROCESSES]` array and
+  `process_create()`, which fabricates a fake saved context so a brand-new
+  process starts at its entry point the first time it's switched to.
+- `kernel/scheduler.c` owns the ready queue (a singly-linked list via
+  `pcb->next`) and `scheduler_tick()`, which performs an actual round-robin
+  switch every 10 ticks (a 100 ms quantum).
+
+**Proving two processes run concurrently:** at boot, two background
+processes are created automatically (`demo_process_a`, `demo_process_b` in
+`kernel/kernel.c`). Each spins a `|/-\` character in a fixed corner of the
+screen (`P1:` and `P2:`, top-right), busy-waiting a different number of
+iterations between updates so they visibly spin at different rates -
+independently of, and concurrently with, the interactive shell (PCB 0).
+They write through the new `vga_put_at()` helper so they never disturb the
+shell's cursor.
+
+**New/changed shell command:**
+
+| Command | Arguments | Behaviour                                    |
+|---------|-----------|-----------------------------------------------|
+| `ps`    | -         | Lists every PCB: pid, state, saved ESP         |
+
+### How to test Stage 1
+
+1. `make run` and wait for the splash screen.
+2. Watch the top-right corner: `P1:` and `P2:` should each show a spinning
+   character (`|/-\`), changing at visibly different speeds - this is the
+   two background processes running concurrently.
+3. While they keep spinning, use the shell normally: `help`, `echo test`,
+   `version` - it should stay fully responsive.
+4. `ps` - should list 3 PCBs (pid 0 = the shell, pid 1 and 2 = the demo
+   processes) with their state (`RUNNING`/`READY`) and ESP.
+5. `halt` - should still stop the CPU cleanly with no crash or reboot.
 
 No optional/bonus extensions are implemented in this stage.
 
